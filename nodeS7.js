@@ -35,10 +35,15 @@ var net = require("net");
 var _ = require("underscore");
 var util = require("util");
 var effectiveDebugLevel = 0; // intentionally global, shared between connections
+var silentMode = false;
 
 module.exports = NodeS7;
 
-function NodeS7(){
+function NodeS7(opts){
+  opts = opts || {};
+  silentMode = opts.silent || false;
+  effectiveDebugLevel = opts.debug ? 99 : 0
+
   var self = this;
 
   self.connectReq = new Buffer([0x03,0x00,0x00,0x16,0x11,0xe0,0x00,0x00,0x00,0x02,0x00,0xc0,0x01,0x0a,0xc1,0x02,0x01,0x00,0xc2,0x02,0x01,0x02]);
@@ -177,10 +182,13 @@ NodeS7.prototype.packetTimeout = function (packetType, packetSeqNum) {
 	}
 	if (packetType === "PDU") {
 		outputLog("TIMED OUT waiting for PDU reply packet from PLC - Disconnecting");
-		self.isoclient.end();
+		outputLog("Wait for 2 seconds then try again.",0,self.connectionID);		
+		self.connectionReset();
+		outputLog("Scheduling a reconnect from packetTimeout, connect type",0,self.connectionID);
 		setTimeout(function(){
-      self.connectNow.apply(self,arguments);
-    }, 2000, self.connectionParams);
+			outputLog("The scheduled reconnect from packetTimeout, PDU type, is happening now",0,self.connectionID);
+			self.connectNow.apply(self,arguments);
+		}, 2000, self.connectionParams);
 		return undefined;
 	}
 	if (packetType === "read") {
@@ -378,6 +386,8 @@ NodeS7.prototype.writeItems = function(arg, value, cb) {
 NodeS7.prototype.findItem = function(useraddr) {
 	var self = this
 	  , i;
+	var commstate = { value: self.isoConnectionState !== 4, quality: 'OK' };
+	if (useraddr === '_COMMERR') { return commstate; }
 	for (i = 0; i < self.polledReadBlockList.length; i++) {
 		if (self.polledReadBlockList[i].useraddr === useraddr) { return self.polledReadBlockList[i]; } 
 	}
@@ -394,11 +404,11 @@ NodeS7.prototype.addItemsNow = function(arg) {
 	  , i;
 	outputLog("Adding " + arg,0,self.connectionID);
 	addItemsFlag = false;
-	if (typeof arg === "string") { 
+	if (typeof(arg) === "string" && arg !== "_COMMERR") { 
 		self.polledReadBlockList.push(stringToS7Addr(self.translationCB(arg), arg));
 	} else if (_.isArray(arg)) {
 		for (i = 0; i < arg.length; i++) {
-			if (typeof arg[i] === "string") {
+			if (typeof(arg[i]) === "string" && arg[i] !== "_COMMERR") {
 				self.polledReadBlockList.push(stringToS7Addr(self.translationCB(arg[i]), arg[i]));
 			}
 		}
@@ -666,7 +676,7 @@ NodeS7.prototype.prepareWritePacket = function() {
 			}
 			requestNumber++;
 			numItems++;
-			packetWriteLength += (requestList[i].byteLengthWithFill + 4);
+			packetWriteLength += (requestList[i].byteLengthWithFill + 12 + 4); // Don't forget each request has a 12 byte header as well.
 			//outputLog('I is ' + i + ' Addr Type is ' + requestList[i].addrtype + ' and type is ' + requestList[i].datatype + ' and DBNO is ' + requestList[i].dbNumber + ' and offset is ' + requestList[i].offset + ' bit ' + requestList[i].bitOffset + ' len ' + requestList[i].arrayLength);
 			//S7AddrToBuffer(requestList[i]).copy(self.writeReq, 19 + numItems * 12);  // i or numItems?  used to be i.  
 			//itemBuffer = bufferizeS7Packet(requestList[i]);
@@ -1256,7 +1266,7 @@ NodeS7.prototype.readResponse = function(data, foundSeqNum) {
 
 
 NodeS7.prototype.onClientDisconnect = function(){
-  var self = this;
+  	var self = this;
 	outputLog('ISO-on-TCP connection DISCONNECTED.',0,self.connectionID);
 
 	// We issue the callback here for Trela/Honcho - in some cases TCP connects, and ISO-on-TCP doesn't.  
@@ -1266,8 +1276,12 @@ NodeS7.prototype.onClientDisconnect = function(){
 		self.connectCallback("Error - TCP connected, ISO didn't");
 	}
 
-	self.connectionCleanup();
-	self.tryingToConnectNow = false;
+	// We used to call self.connectionCleanup() - in other words we would give up.
+	// However - realize that this event is called when the OTHER END of the connection sends a FIN packet.  
+	// Certain situations (download user program to mem card on S7-400, pop memory card out of S7-300, both with NetLink) cause this to happen.
+	// So now, let's try a "connetionReset".  This way, we are guaranteed to return values (or bad) and reset at the proper time.
+	// self.connectionCleanup();
+	self.connectionReset();
 }
 
 NodeS7.prototype.connectionReset = function() {
@@ -1520,10 +1534,11 @@ function writePostProcess(theItem) {
 function processS7ReadItem(theItem) {
 	
 	var thePointer = 0;
+	var strlen = 0;
 	
 	if (theItem.arrayLength > 1) {
 		// Array value.  
-		if (theItem.datatype != 'C' && theItem.datatype != 'CHAR') {
+		if (theItem.datatype != 'C' && theItem.datatype != 'CHAR' && theItem.datatype != 'S' && theItem.datatype != 'STRING') {
 			theItem.value = [];
 			theItem.quality = [];
 		} else {
@@ -1533,8 +1548,13 @@ function processS7ReadItem(theItem) {
 		var bitShiftAmount = theItem.bitOffset;
 		for (arrayIndex = 0; arrayIndex < theItem.arrayLength; arrayIndex++) {
 			if (theItem.qualityBuffer[thePointer] !== 0xC0) {
-				theItem.value.push(theItem.badValue());
-				theItem.quality.push('BAD ' + theItem.qualityBuffer[thePointer]);
+				if (theItem.quality instanceof Array) {
+					theItem.value.push(theItem.badValue());
+					theItem.quality.push('BAD ' + theItem.qualityBuffer[thePointer]);
+				} else {
+					theItem.value = theItem.badValue();
+					theItem.quality = 'BAD ' + theItem.qualityBuffer[thePointer];
+				}
 			} else {
 				// If we're a string, quality is not an array.
 				if (theItem.quality instanceof Array) {
@@ -1566,7 +1586,16 @@ function processS7ReadItem(theItem) {
 				case "BYTE":
 					theItem.value.push(theItem.byteBuffer.readUInt8(thePointer));
 					break;
-
+				case "S":
+				case "STRING":
+					if (arrayIndex === 1) {
+						strlen = theItem.byteBuffer.readUInt8(thePointer);
+					}					
+					if (arrayIndex > 1 && arrayIndex < (strlen + 2)) {  // say strlen = 1 (one-char string) this char is at arrayIndex of 2.
+						// Convert to string.  
+						theItem.value += String.fromCharCode(theItem.byteBuffer.readUInt8(thePointer));
+					}
+					break;
 				case "C":
 				case "CHAR":
 					// Convert to string.  
@@ -1628,6 +1657,7 @@ function processS7ReadItem(theItem) {
 				// No support as of yet for signed 8 bit.  This isn't that common in Siemens.  
 				theItem.value = theItem.byteBuffer.readUInt8(thePointer);
 				break;
+			// No support for single strings.			
 			case "C":
 			case "CHAR":
 				// No support as of yet for signed 8 bit.  This isn't that common in Siemens.  
@@ -1720,6 +1750,19 @@ function bufferizeS7Item(theItem) {
 //??					theItem.writeBuffer.writeUInt8(theItem.writeValue.toCharCode(), thePointer);
 					theItem.writeBuffer.writeUInt8(theItem.writeValue.charCodeAt(arrayIndex), thePointer);
 					break;
+				case "S":
+				case "STRING":
+					// Convert to string.  
+					if (arrayIndex === 0) {
+						theItem.writeBuffer.writeUInt8(theItem.arrayLength-2, thePointer); // Array length is requested val, -2 is string length
+					} else if (arrayIndex === 1) {												
+						theItem.writeBuffer.writeUInt8(Math.min(theItem.arrayLength-2,theItem.writeValue.length), thePointer); 
+					} else if (arrayIndex > 1 && arrayIndex < (theItem.writeValue.length + 2)) { 
+						theItem.writeBuffer.writeUInt8(theItem.writeValue.charCodeAt(arrayIndex-2), thePointer);
+					} else {
+						theItem.writeBuffer.writeUInt8(32, thePointer); // write space
+					}
+					break;				
 				case "TIMER":
 				case "COUNTER":
 					// I didn't think we supported arrays of timers and counters.
@@ -1793,6 +1836,9 @@ function bufferizeS7Item(theItem) {
 function stringToS7Addr(addr, useraddr) {
 	"use strict";
 	var theItem, splitString, splitString2;
+
+	if (useraddr === '_COMMERR') { return undefined; } // Special-case for communication error status - this variable returns true when there is a communications error
+
 	theItem = new S7Item();
 	splitString = addr.split(',');
 	if (splitString.length === 0 || splitString.length > 2) {
@@ -1943,6 +1989,19 @@ function stringToS7Addr(addr, useraddr) {
 		theItem.offset = parseInt(splitString2[0].replace(/[A-z]/gi, ''), 10);
 	}
 
+	if (theItem.datatype === 'DI') {
+		theItem.datatype = 'DINT';
+	}
+	if (theItem.datatype === 'I') {
+		theItem.datatype = 'INT';
+	}
+	if (theItem.datatype === 'DW') {
+		theItem.datatype = 'DWORD';
+	}
+	if (theItem.datatype === 'R') {
+		theItem.datatype = 'REAL';
+	}
+
 	switch (theItem.datatype) {
 	case "REAL":
 	case "DWORD":
@@ -1960,6 +2019,11 @@ function stringToS7Addr(addr, useraddr) {
 	case "C":
 	case "BYTE":
 	case "CHAR":
+		theItem.dtypelen = 1;
+		break;
+	case "S":
+	case "STRING":
+		theItem.arrayLength += 2;
 		theItem.dtypelen = 1;
 		break;
 	default:
@@ -2002,7 +2066,7 @@ function stringToS7Addr(addr, useraddr) {
 		return undefined;
 	}
 
-	if (theItem.datatype === 'X') {
+	if (theItem.datatype === 'X' && theItem.arrayLength === 1) {
 		theItem.writeTransportCode = 0x03;
 	} else {
 		theItem.writeTransportCode = theItem.readTransportCode;
@@ -2113,6 +2177,8 @@ function S7Item() { // Object
 			return false;
 		case "C":
 		case "CHAR":
+		case "S":
+		case "STRING":
 			// Convert to string.  
 			return "";
 		default:
@@ -2160,6 +2226,8 @@ function outputError(txt) {
 }
 
 function outputLog(txt, debugLevel, id) {
+	if(silentMode) return;
+
 	var idtext;
 	if (typeof(id) === 'undefined') {
 		idtext = '';
